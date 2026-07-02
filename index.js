@@ -43,31 +43,35 @@ app.post('/webhook/admin', async (req, res) => {
 });
 
 // ─── Outbound Telegram API Proxy (HF to Telegram) ────────────────────────────
-// Hugging Face blocks outbound requests to api.telegram.org on Free Tier
-// So the backend sends them here, and we forward them to Telegram
-app.all('/bot:token/:method', async (req, res) => {
+const https = require('https');
+
+app.all('/bot:token/:method', (req, res) => {
     const { token, method } = req.params;
-    const url = `https://api.telegram.org/bot${token}/${method}`;
     
-    try {
-        const response = await axios({
-            method: req.method,
-            url: url,
-            data: req.body,
-            headers: {
-                'Content-Type': req.headers['content-type'] || 'application/json'
-            },
-            timeout: 10000
-        });
-        res.status(response.status).send(response.data);
-    } catch (err) {
-        if (err.response) {
-            res.status(err.response.status).send(err.response.data);
-        } else {
-            console.error(`Error proxying outbound request to ${method}:`, err.message);
-            res.status(500).send({ ok: false, description: err.message });
-        }
-    }
+    const options = {
+        hostname: 'api.telegram.org',
+        port: 443,
+        path: `/bot${token}/${method}`,
+        method: req.method,
+        headers: { ...req.headers }
+    };
+    
+    // Clean headers that shouldn't be forwarded
+    delete options.headers['host'];
+    delete options.headers['connection'];
+    
+    const proxyReq = https.request(options, (proxyRes) => {
+        res.writeHead(proxyRes.statusCode, proxyRes.headers);
+        proxyRes.pipe(res, { end: true });
+    });
+    
+    proxyReq.on('error', (err) => {
+        console.error(`Error proxying outbound request to ${method}:`, err.message);
+        res.status(500).send({ ok: false, description: err.message });
+    });
+    
+    // Pipe the original request body straight to the Telegram API
+    req.pipe(proxyReq, { end: true });
 });
 
 // ─── Health & Keep-Alive ─────────────────────────────────────────────────────
