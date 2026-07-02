@@ -13,11 +13,9 @@ if (!HF_BACKEND_URL) {
     console.warn("⚠️ HF_BACKEND_URL is not set. Please set it to your Hugging Face space URL (e.g., https://username-spacename.hf.space)");
 }
 
-// ─── Webhook Forwarding ──────────────────────────────────────────────────────
+// ─── Webhook Forwarding (Inbound to HF) ──────────────────────────────────────
 app.post('/webhook/main', async (req, res) => {
-    // Acknowledge Telegram immediately to prevent retries
     res.sendStatus(200);
-
     if (!HF_BACKEND_URL) return;
 
     try {
@@ -32,7 +30,6 @@ app.post('/webhook/main', async (req, res) => {
 
 app.post('/webhook/admin', async (req, res) => {
     res.sendStatus(200);
-
     if (!HF_BACKEND_URL) return;
 
     try {
@@ -45,12 +42,39 @@ app.post('/webhook/admin', async (req, res) => {
     }
 });
 
+// ─── Outbound Telegram API Proxy (HF to Telegram) ────────────────────────────
+// Hugging Face blocks outbound requests to api.telegram.org on Free Tier
+// So the backend sends them here, and we forward them to Telegram
+app.all('/bot:token/:method', async (req, res) => {
+    const { token, method } = req.params;
+    const url = `https://api.telegram.org/bot${token}/${method}`;
+    
+    try {
+        const response = await axios({
+            method: req.method,
+            url: url,
+            data: req.body,
+            headers: {
+                'Content-Type': req.headers['content-type'] || 'application/json'
+            },
+            timeout: 10000
+        });
+        res.status(response.status).send(response.data);
+    } catch (err) {
+        if (err.response) {
+            res.status(err.response.status).send(err.response.data);
+        } else {
+            console.error(`Error proxying outbound request to ${method}:`, err.message);
+            res.status(500).send({ ok: false, description: err.message });
+        }
+    }
+});
+
 // ─── Health & Keep-Alive ─────────────────────────────────────────────────────
 app.get('/ping', (req, res) => {
     res.send('Proxy is awake');
 });
 
-// Ping Hugging Face every 2 minutes (120000 ms) to keep it awake
 setInterval(async () => {
     if (!HF_BACKEND_URL) return;
     try {
@@ -61,7 +85,6 @@ setInterval(async () => {
     }
 }, 120000);
 
-// Also ping itself every 10 minutes (Render free tier sleeps after 15 min)
 const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL;
 if (RENDER_EXTERNAL_URL) {
     setInterval(async () => {
@@ -71,10 +94,11 @@ if (RENDER_EXTERNAL_URL) {
         } catch (err) {
             console.error(`[Keep-Alive] Failed to ping Render self:`, err.message);
         }
-    }, 600000); // 10 minutes
+    }, 600000);
 }
 
 app.listen(PORT, () => {
     console.log(`🚀 Render Proxy running on port ${PORT}`);
-    console.log(`🔗 Forwarding to: ${HF_BACKEND_URL || 'NOT SET'}`);
+    console.log(`🔗 Forwarding INBOUND to: ${HF_BACKEND_URL || 'NOT SET'}`);
+    console.log(`🔗 Proxying OUTBOUND for Telegram API enabled`);
 });
