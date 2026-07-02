@@ -1,91 +1,97 @@
 require('dotenv').config();
 const express = require('express');
+const https = require('https');
+const http = require('http');
 const axios = require('axios');
 
 const app = express();
-app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 const HF_BACKEND_URL = process.env.HF_BACKEND_URL;
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || 'luckybirr_super_secret';
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
 
 if (!HF_BACKEND_URL) {
-    console.warn("⚠️ HF_BACKEND_URL is not set. Please set it to your Hugging Face space URL (e.g., https://username-spacename.hf.space)");
+    console.warn("⚠️ HF_BACKEND_URL is not set.");
 }
 
-// ─── Webhook Forwarding (Inbound to HF) ──────────────────────────────────────
+// ─── Outbound Telegram API Proxy ──────────────────────────────────────────────
+// IMPORTANT: This MUST come BEFORE express.json() so req is still a raw stream
+// HF cannot reach api.telegram.org, so the backend sends outbound calls here
+app.all(/^\/bot([^/]+)\/(.+)$/, (req, res) => {
+    const token  = req.params[0];
+    const method = req.params[1];
+
+    const options = {
+        hostname: 'api.telegram.org',
+        port: 443,
+        path: `/bot${token}/${method}`,
+        method: req.method,
+        headers: {}
+    };
+
+    // Copy safe headers, skip hop-by-hop headers
+    const skipHeaders = ['host', 'connection', 'transfer-encoding', 'upgrade', 'keep-alive'];
+    for (const [key, val] of Object.entries(req.headers)) {
+        if (!skipHeaders.includes(key.toLowerCase())) {
+            options.headers[key] = val;
+        }
+    }
+
+    const proxyReq = https.request(options, (proxyRes) => {
+        res.writeHead(proxyRes.statusCode, proxyRes.headers);
+        proxyRes.pipe(res, { end: true });
+    });
+
+    proxyReq.on('error', (err) => {
+        console.error(`[Outbound Proxy] Error on /bot.../  ${method}:`, err.message);
+        if (!res.headersSent) res.status(502).json({ ok: false, description: err.message });
+    });
+
+    // Pipe raw request body directly — do NOT use express.json() above this
+    req.pipe(proxyReq, { end: true });
+});
+
+// ─── JSON body parser (only for routes below this line) ──────────────────────
+app.use(express.json());
+
+// ─── Inbound Webhook Forwarding (Telegram → Render → HF) ─────────────────────
 app.post('/webhook/main', async (req, res) => {
     res.sendStatus(200);
     if (!HF_BACKEND_URL) return;
-
     try {
         await axios.post(`${HF_BACKEND_URL}/webhook/main`, req.body, {
-            headers: { 'x-webhook-secret': WEBHOOK_SECRET },
+            headers: { 'x-webhook-secret': WEBHOOK_SECRET, 'content-type': 'application/json' },
             timeout: 10000
         });
     } catch (err) {
-        console.error('Error forwarding main bot webhook:', err.message);
+        console.error('[Inbound] Error forwarding main webhook:', err.message);
     }
 });
 
 app.post('/webhook/admin', async (req, res) => {
     res.sendStatus(200);
     if (!HF_BACKEND_URL) return;
-
     try {
         await axios.post(`${HF_BACKEND_URL}/webhook/admin`, req.body, {
-            headers: { 'x-webhook-secret': WEBHOOK_SECRET },
+            headers: { 'x-webhook-secret': WEBHOOK_SECRET, 'content-type': 'application/json' },
             timeout: 10000
         });
     } catch (err) {
-        console.error('Error forwarding admin bot webhook:', err.message);
+        console.error('[Inbound] Error forwarding admin webhook:', err.message);
     }
 });
 
-// ─── Outbound Telegram API Proxy (HF to Telegram) ────────────────────────────
-const https = require('https');
+// ─── Health Check ─────────────────────────────────────────────────────────────
+app.get('/ping', (req, res) => res.send('pong'));
 
-app.all('/bot:token/:method', (req, res) => {
-    const { token, method } = req.params;
-    
-    const options = {
-        hostname: 'api.telegram.org',
-        port: 443,
-        path: `/bot${token}/${method}`,
-        method: req.method,
-        headers: { ...req.headers }
-    };
-    
-    // Clean headers that shouldn't be forwarded
-    delete options.headers['host'];
-    delete options.headers['connection'];
-    
-    const proxyReq = https.request(options, (proxyRes) => {
-        res.writeHead(proxyRes.statusCode, proxyRes.headers);
-        proxyRes.pipe(res, { end: true });
-    });
-    
-    proxyReq.on('error', (err) => {
-        console.error(`Error proxying outbound request to ${method}:`, err.message);
-        res.status(500).send({ ok: false, description: err.message });
-    });
-    
-    // Pipe the original request body straight to the Telegram API
-    req.pipe(proxyReq, { end: true });
-});
-
-// ─── Health & Keep-Alive ─────────────────────────────────────────────────────
-app.get('/ping', (req, res) => {
-    res.send('Proxy is awake');
-});
-
+// ─── Keep-Alive Pinger ────────────────────────────────────────────────────────
 setInterval(async () => {
     if (!HF_BACKEND_URL) return;
     try {
-        await axios.get(`${HF_BACKEND_URL}/api/health`, { timeout: 10000 });
-        console.log(`[Keep-Alive] Pinged Hugging Face successfully at ${new Date().toISOString()}`);
+        await axios.get(`${HF_BACKEND_URL}/api/health`, { timeout: 8000 });
+        console.log(`[Keep-Alive] HF pinged OK at ${new Date().toISOString()}`);
     } catch (err) {
-        console.error(`[Keep-Alive] Failed to ping Hugging Face:`, err.message);
+        console.error(`[Keep-Alive] HF ping failed:`, err.message);
     }
 }, 120000);
 
@@ -94,15 +100,12 @@ if (RENDER_EXTERNAL_URL) {
     setInterval(async () => {
         try {
             await axios.get(`${RENDER_EXTERNAL_URL}/ping`);
-            console.log(`[Keep-Alive] Pinged Render self successfully`);
-        } catch (err) {
-            console.error(`[Keep-Alive] Failed to ping Render self:`, err.message);
-        }
+        } catch (_) {}
     }, 600000);
 }
 
 app.listen(PORT, () => {
     console.log(`🚀 Render Proxy running on port ${PORT}`);
     console.log(`🔗 Forwarding INBOUND to: ${HF_BACKEND_URL || 'NOT SET'}`);
-    console.log(`🔗 Proxying OUTBOUND for Telegram API enabled`);
+    console.log(`🔗 Proxying OUTBOUND Telegram API calls`);
 });
